@@ -155,6 +155,45 @@ zalo_monitor_thread = None
 zalo_login_status = "Disconnected"  # "Disconnected", "Waiting for login", "Active", "Error"
 latest_zalo_message = None  # Dict: {"prompt": "...", "qr_link": "...", "processed": False, "timestamp": "..."}
 
+playwright_manager = None
+global_browser = None
+
+def get_shared_browser():
+    global playwright_manager, global_browser
+    if global_browser is None:
+        try:
+            from playwright.sync_api import sync_playwright
+            if playwright_manager is None:
+                playwright_manager = sync_playwright().start()
+            global_browser = playwright_manager.chromium.connect_over_cdp("http://127.0.0.1:9222")
+            print("[Playwright] Connected to Chrome over CDP on port 9222 successfully.")
+        except Exception as e:
+            print(f"[Playwright] Error connecting to Chrome: {e}")
+            if playwright_manager:
+                try:
+                    playwright_manager.stop()
+                except Exception:
+                    pass
+                playwright_manager = None
+            global_browser = None
+    else:
+        try:
+            # Check connection
+            _ = global_browser.contexts
+        except Exception:
+            print("[Playwright] Connection lost, reconnecting...")
+            global_browser = None
+            if playwright_manager:
+                try:
+                    playwright_manager.stop()
+                except Exception:
+                    pass
+                playwright_manager = None
+            return get_shared_browser()
+            
+    return global_browser
+
+
 def clean_zalo_message(text):
     if not text:
         return ""
@@ -265,44 +304,62 @@ def zalo_monitor_loop():
                                 
                     time.sleep(1.0)
                     
-                    # Read last message via JS evaluation
-                    js_get_last_message = """
+                    # Read the most recent incoming message containing a link or text via JS evaluation
+                    js_get_last_url_message = """
                     () => {
-                        const scrollList = document.querySelector('.chat-date-container, .chat-message-list, [id*="chat-body"], .chat-box');
-                        if (!scrollList) {
-                            const items = document.querySelectorAll('.msg-text, .card--text, [class*="message-text"], [class*="msg-text-style"]');
-                            if (items.length > 0) return items[items.length - 1].innerText;
-                            return null;
+                        const items = Array.from(document.querySelectorAll('.chat-item'))
+                            .filter(item => !item.classList.contains('me'));
+                        
+                        items.reverse(); // check from newest to oldest
+                        
+                        for (const item of items) {
+                            const anchor = item.querySelector('a');
+                            const textWrapper = item.querySelector('.link-message__text-wrapper, .text-message__container');
+                            const textEl = item.querySelector('.text, .message-content-render');
+                            
+                            let text = "";
+                            if (textWrapper) {
+                                text = textWrapper.innerText;
+                            } else if (textEl) {
+                                text = textEl.innerText;
+                            }
+                            
+                            if (anchor || text.includes('http://') || text.includes('https://')) {
+                                let url = anchor ? anchor.href : '';
+                                if (!url) {
+                                    const match = text.match(/https?:\\/\\/[^\\s]+/);
+                                    url = match ? match[0] : '';
+                                }
+                                return {
+                                    found: true,
+                                    text: text,
+                                    url: url
+                                };
+                            }
                         }
-                        const bubbles = scrollList.querySelectorAll('.msg-text, .card--text, [class*="msg-text"], [class*="message-text"]');
-                        if (bubbles.length > 0) {
-                            return bubbles[bubbles.length - 1].innerText;
-                        }
-                        const divs = Array.from(scrollList.querySelectorAll('div'))
-                            .filter(d => d.children.length === 0 && d.innerText && d.innerText.trim().length > 0);
-                        if (divs.length > 0) {
-                            return divs[divs.length - 1].innerText;
-                        }
-                        return null;
+                        return { found: false, text: null, url: null };
                     }
                     """
                     
-                    last_msg_text = zalo_page.evaluate(js_get_last_message)
-                    if last_msg_text:
-                        last_msg_text = last_msg_text.strip()
-                        if last_msg_text != last_processed_text:
-                            qr_link = extract_zalo_url(last_msg_text)
-                            prompt = clean_zalo_message(last_msg_text)
+                    res = zalo_page.evaluate(js_get_last_url_message)
+                    if res and res.get('found'):
+                        raw_text = res.get('text', '').strip()
+                        raw_url = res.get('url', '').strip()
+                        
+                        # We use raw_text + raw_url as unique key to avoid reprocessing
+                        msg_unique_key = f"{raw_text}||{raw_url}"
+                        
+                        if msg_unique_key != last_processed_text:
+                            prompt = clean_zalo_message(raw_text)
                             
-                            if prompt or qr_link:
-                                latest_zalo_message = {
-                                    "prompt": prompt,
-                                    "qr_link": qr_link,
-                                    "processed": False,
-                                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                }
-                                last_processed_text = last_msg_text
-                                print(f"[Zalo] Nhận tin nhắn mới - Prompt: '{prompt}', Link: '{qr_link}'")
+                            latest_zalo_message = {
+                                "prompt": prompt,
+                                "qr_link": raw_url,
+                                "processed": False,
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            }
+                            last_processed_text = msg_unique_key
+                            print(f"[Zalo] Nhận tin nhắn mới - Prompt: '{prompt}', Link: '{raw_url}'")
                 except Exception as e:
                     print(f"[Zalo] Lỗi đọc tin nhắn cuộc trò chuyện: {e}")
                     
@@ -421,15 +478,16 @@ def launch_chrome():
     print(f"Launching Chrome: {' '.join(cmd)}")
     chrome_process = subprocess.Popen(cmd)
 
-def get_gemini_page(playwright_inst):
-    try:
-        browser = playwright_inst.chromium.connect_over_cdp("http://127.0.0.1:9222")
-    except Exception as e:
+def get_gemini_page():
+    browser = get_shared_browser()
+    if not browser:
         print("Chrome is not running, launching it...")
         launch_chrome()
         time.sleep(3.0)
-        browser = playwright_inst.chromium.connect_over_cdp("http://127.0.0.1:9222")
-        
+        browser = get_shared_browser()
+        if not browser:
+            raise Exception("Không thể kết nối tới Google Chrome.")
+            
     context = browser.contexts[0]
     for page in context.pages:
         if "gemini.google.com" in page.url:
