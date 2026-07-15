@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Automated browser profile
+chrome_profile/
+
+# Generated images/output files
+generated_images/
+*.jpg
+*.jpeg
+*.png
+history.json
+config.json
+
