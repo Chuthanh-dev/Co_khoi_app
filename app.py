@@ -116,8 +116,12 @@ DEFAULT_CONFIG = {
     "save_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), 'generated_images'),
     "model": "imagen-3.0-generate-002",
     "aspect_ratio": "1:1",
-    "quality": "standard"
+    "quality": "standard",
+    "zalo_sync_enabled": False,
+    "zalo_contact_name": "Cô Trinh _Khôi",
+    "zalo_auto_generate": False
 }
+
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -141,6 +145,237 @@ def save_config(config):
     except Exception as e:
         print(f"Error saving config: {e}")
         return False
+
+import threading
+import re
+
+# Zalo Integration Global Variables
+zalo_monitor_active = False
+zalo_monitor_thread = None
+zalo_login_status = "Disconnected"  # "Disconnected", "Waiting for login", "Active", "Error"
+latest_zalo_message = None  # Dict: {"prompt": "...", "qr_link": "...", "processed": False, "timestamp": "..."}
+
+def clean_zalo_message(text):
+    if not text:
+        return ""
+    # Remove introductory phrases (case-insensitive, with variations)
+    patterns = [
+        r"(?i)ba\s+làm\s+(giùm|giúp)\s+cô\s+mã\s+này\.?",
+        r"(?i)ba\s+làm\s+(giùm|giúp)\s+cô\.?",
+        r"(?i)ba\s+làm\s+(giùm|giúp)\.?\s*"
+    ]
+    cleaned = text
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned)
+    
+    # Strip URL from the prompt text
+    url_pattern = r"https?://[^\s]+"
+    cleaned = re.sub(url_pattern, "", cleaned)
+    
+    # Clean leading/trailing spaces and punctuation
+    cleaned = cleaned.strip(" .,;-\n")
+    return cleaned
+
+def extract_zalo_url(text):
+    if not text:
+        return ""
+    url_pattern = r"(https?://[^\s]+)"
+    match = re.search(url_pattern, text)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+def zalo_monitor_loop():
+    global zalo_monitor_active, latest_zalo_message, zalo_login_status
+    print("Zalo monitor background loop started.")
+    last_processed_text = None
+    
+    while zalo_monitor_active:
+        try:
+            config = load_config()
+            contact_name = config.get("zalo_contact_name", "Cô Trinh _Khôi")
+            
+            with sync_playwright() as p:
+                try:
+                    browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                except Exception:
+                    zalo_login_status = "Disconnected"
+                    time.sleep(5)
+                    continue
+                
+                context = browser.contexts[0]
+                zalo_page = None
+                
+                for page in context.pages:
+                    if "chat.zalo.me" in page.url:
+                        zalo_page = page
+                        break
+                
+                if not zalo_page:
+                    try:
+                        # Create Zalo page in background
+                        zalo_page = context.new_page()
+                        zalo_page.goto("https://chat.zalo.me")
+                    except Exception as e:
+                        print(f"[Zalo] Lỗi mở trang Zalo Web: {e}")
+                        zalo_login_status = "Error"
+                        time.sleep(5)
+                        continue
+                
+                # Check for login redirection
+                if "id.zalo.me" in zalo_page.url:
+                    zalo_login_status = "Waiting for login"
+                    time.sleep(5)
+                    continue
+                
+                zalo_login_status = "Active"
+                
+                # Find contact in sidebar and click
+                try:
+                    contact_locator = zalo_page.locator(f'text="{contact_name}"').first
+                    if contact_locator.is_visible():
+                        contact_locator.click()
+                    else:
+                        # Use search box
+                        search_selectors = [
+                            'input[placeholder*="Tìm kiếm"]',
+                            'input[placeholder*="Search"]',
+                            '#contact-search-input'
+                        ]
+                        search_el = None
+                        for sel in search_selectors:
+                            try:
+                                el = zalo_page.locator(sel).first
+                                if el.is_visible():
+                                    search_el = el
+                                    break
+                            except Exception:
+                                pass
+                        
+                        if search_el:
+                            search_el.click()
+                            search_el.fill("")
+                            search_el.type(contact_name)
+                            time.sleep(1.5)
+                            first_result = zalo_page.locator(f'div.search-result-item:has-text("{contact_name}")').first
+                            if first_result.is_visible():
+                                first_result.click()
+                            else:
+                                zalo_page.locator(f'text="{contact_name}"').first.click()
+                                
+                    time.sleep(1.0)
+                    
+                    # Read last message via JS evaluation
+                    js_get_last_message = """
+                    () => {
+                        const scrollList = document.querySelector('.chat-date-container, .chat-message-list, [id*="chat-body"], .chat-box');
+                        if (!scrollList) {
+                            const items = document.querySelectorAll('.msg-text, .card--text, [class*="message-text"], [class*="msg-text-style"]');
+                            if (items.length > 0) return items[items.length - 1].innerText;
+                            return null;
+                        }
+                        const bubbles = scrollList.querySelectorAll('.msg-text, .card--text, [class*="msg-text"], [class*="message-text"]');
+                        if (bubbles.length > 0) {
+                            return bubbles[bubbles.length - 1].innerText;
+                        }
+                        const divs = Array.from(scrollList.querySelectorAll('div'))
+                            .filter(d => d.children.length === 0 && d.innerText && d.innerText.trim().length > 0);
+                        if (divs.length > 0) {
+                            return divs[divs.length - 1].innerText;
+                        }
+                        return null;
+                    }
+                    """
+                    
+                    last_msg_text = zalo_page.evaluate(js_get_last_message)
+                    if last_msg_text:
+                        last_msg_text = last_msg_text.strip()
+                        if last_msg_text != last_processed_text:
+                            qr_link = extract_zalo_url(last_msg_text)
+                            prompt = clean_zalo_message(last_msg_text)
+                            
+                            if prompt or qr_link:
+                                latest_zalo_message = {
+                                    "prompt": prompt,
+                                    "qr_link": qr_link,
+                                    "processed": False,
+                                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                }
+                                last_processed_text = last_msg_text
+                                print(f"[Zalo] Nhận tin nhắn mới - Prompt: '{prompt}', Link: '{qr_link}'")
+                except Exception as e:
+                    print(f"[Zalo] Lỗi đọc tin nhắn cuộc trò chuyện: {e}")
+                    
+            time.sleep(5)
+        except Exception as e:
+            print(f"[Zalo] Lỗi vòng lặp giám sát: {e}")
+            time.sleep(5)
+    print("Zalo monitor background loop stopped.")
+
+def start_zalo_monitor():
+    global zalo_monitor_active, zalo_monitor_thread
+    if not zalo_monitor_active:
+        zalo_monitor_active = True
+        zalo_monitor_thread = threading.Thread(target=zalo_monitor_loop, daemon=True)
+        zalo_monitor_thread.start()
+        print("Zalo monitor started successfully.")
+
+def stop_zalo_monitor():
+    global zalo_monitor_active
+    zalo_monitor_active = False
+    print("Zalo monitor requested to stop.")
+
+@app.route('/api/zalo/status', methods=['GET'])
+def get_zalo_status():
+    config = load_config()
+    return jsonify({
+        "status": "success",
+        "active": zalo_monitor_active,
+        "login_status": zalo_login_status,
+        "contact_name": config.get("zalo_contact_name", "Cô Trinh _Khôi"),
+        "auto_generate": config.get("zalo_auto_generate", False)
+    })
+
+@app.route('/api/zalo/toggle', methods=['POST'])
+def toggle_zalo():
+    data = request.json or {}
+    active = data.get('active', False)
+    contact_name = data.get('contact_name', 'Cô Trinh _Khôi').strip()
+    auto_generate = data.get('auto_generate', False)
+    
+    config = load_config()
+    config["zalo_contact_name"] = contact_name
+    config["zalo_sync_enabled"] = active
+    config["zalo_auto_generate"] = auto_generate
+    save_config(config)
+    
+    if active:
+        start_zalo_monitor()
+    else:
+        stop_zalo_monitor()
+        
+    return jsonify({
+        "status": "success",
+        "active": zalo_monitor_active,
+        "login_status": zalo_login_status
+    })
+
+@app.route('/api/zalo/latest', methods=['GET'])
+def get_latest_zalo_message():
+    global latest_zalo_message
+    if latest_zalo_message and not latest_zalo_message.get("processed", False):
+        # We clone the message to set processed but keep a copy or mark it
+        msg_copy = latest_zalo_message.copy()
+        latest_zalo_message["processed"] = True
+        return jsonify({
+            "status": "success",
+            "has_new": True,
+            "message": msg_copy
+        })
+    return jsonify({
+        "status": "success",
+        "has_new": False
+    })
 
 chrome_process = None
 
@@ -1051,6 +1286,10 @@ if __name__ == '__main__':
     config = load_config()
     save_dir = config.get('save_dir', DEFAULT_CONFIG['save_dir'])
     os.makedirs(save_dir, exist_ok=True)
+    
+    # Auto-start Zalo monitor if enabled in config
+    if config.get("zalo_sync_enabled", False):
+        start_zalo_monitor()
     
     print("--------------------------------------------------")
     print("Google Banana Pro (Imagen 3) Image Generator Server")

@@ -655,7 +655,185 @@ document.addEventListener('DOMContentLoaded', () => {
 
     btnGenerate.addEventListener('click', generateImage);
 
+    // Zalo Integration Frontend Logic
+    const btnToggleZalo = document.getElementById('btn-toggle-zalo');
+    const zaloContactInput = document.getElementById('zalo-contact-input');
+    const zaloAutoGenCheckbox = document.getElementById('zalo-auto-gen-checkbox');
+    const zaloStatusBadge = document.getElementById('zalo-status-badge');
+    const qrLinkInput = document.getElementById('qr-link-input');
+
+    let zaloActive = false;
+    let zaloPollInterval = null;
+    let zaloStatusInterval = null;
+
+    function updateZaloUI(active, loginStatus) {
+        zaloActive = active;
+        
+        // Update badge
+        const text = zaloStatusBadge.querySelector('.badge-text');
+        
+        zaloStatusBadge.className = 'badge'; // reset class
+        
+        if (!active) {
+            zaloStatusBadge.classList.add('badge-disconnected');
+            text.innerText = 'Đang tắt';
+            btnToggleZalo.className = 'btn-secondary btn-block';
+            btnToggleZalo.innerHTML = `<i class="fa-solid fa-power-off"></i> Bật đồng bộ Zalo`;
+            btnToggleZalo.style.background = '';
+            btnToggleZalo.style.borderColor = '';
+        } else {
+            btnToggleZalo.className = 'btn-primary btn-block';
+            btnToggleZalo.style.background = '#10b981';
+            btnToggleZalo.style.borderColor = '#10b981';
+            btnToggleZalo.innerHTML = `<i class="fa-solid fa-circle-stop"></i> Tắt đồng bộ Zalo`;
+            
+            if (loginStatus === 'Waiting for login') {
+                zaloStatusBadge.classList.add('badge-waiting');
+                text.innerText = 'Chờ đăng nhập';
+            } else if (loginStatus === 'Active') {
+                zaloStatusBadge.classList.add('badge-active');
+                text.innerText = 'Đang hoạt động';
+            } else {
+                zaloStatusBadge.classList.add('badge-disconnected');
+                text.innerText = 'Mất kết nối';
+            }
+        }
+    }
+
+    async function loadZaloStatus() {
+        try {
+            const response = await fetch('/api/zalo/status');
+            if (response.ok) {
+                const data = await response.json();
+                zaloContactInput.value = data.contact_name;
+                zaloAutoGenCheckbox.checked = data.auto_generate;
+                updateZaloUI(data.active, data.login_status);
+                
+                if (data.active) {
+                    startZaloPolling();
+                } else {
+                    stopZaloPolling();
+                }
+            }
+        } catch (e) {
+            console.error('Lỗi khi tải trạng thái Zalo:', e);
+        }
+    }
+
+    async function toggleZaloSync() {
+        const targetActive = !zaloActive;
+        const contactName = zaloContactInput.value.trim();
+        const autoGenerate = zaloAutoGenCheckbox.checked;
+        
+        if (targetActive && !contactName) {
+            showToast('Vui lòng nhập tên danh bạ Zalo cần giám sát!', 'error');
+            zaloContactInput.focus();
+            return;
+        }
+
+        btnToggleZalo.disabled = true;
+        btnToggleZalo.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Đang xử lý...`;
+
+        try {
+            const response = await fetch('/api/zalo/toggle', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    active: targetActive,
+                    contact_name: contactName,
+                    auto_generate: autoGenerate
+                })
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                updateZaloUI(data.active, data.login_status);
+                if (data.active) {
+                    showToast('Đã kích hoạt giám sát tin nhắn Zalo. Hãy chắc chắn Chrome đang hoạt động.');
+                    startZaloPolling();
+                } else {
+                    showToast('Đã tắt đồng bộ Zalo.');
+                    stopZaloPolling();
+                }
+            } else {
+                showToast('Lỗi khi thay đổi trạng thái đồng bộ Zalo.', 'error');
+                loadZaloStatus();
+            }
+        } catch (e) {
+            showToast(`Lỗi: ${e.message}`, 'error');
+            loadZaloStatus();
+        } finally {
+            btnToggleZalo.disabled = false;
+        }
+    }
+
+    btnToggleZalo.addEventListener('click', toggleZaloSync);
+
+    function startZaloPolling() {
+        // Clear any old intervals
+        stopZaloPolling();
+        
+        // Poll for new messages every 3 seconds
+        zaloPollInterval = setInterval(async () => {
+            if (!zaloActive) return;
+            try {
+                const response = await fetch('/api/zalo/latest');
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.status === 'success' && data.has_new) {
+                        const msg = data.message;
+                        showToast(`Nhận tin nhắn Zalo mới từ ${zaloContactInput.value}!`);
+                        
+                        // Populate inputs
+                        promptInput.value = msg.prompt;
+                        promptInput.dispatchEvent(new Event('input'));
+                        
+                        if (qrLinkInput) {
+                            qrLinkInput.value = msg.qr_link;
+                        }
+                        
+                        // If auto-generate is checked, start image creation
+                        if (zaloAutoGenCheckbox.checked) {
+                            showToast('Đang tự động khởi chạy tạo ảnh...');
+                            setTimeout(() => {
+                                generateImage();
+                            }, 1000);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error('Lỗi khi lấy tin nhắn Zalo mới:', e);
+            }
+        }, 3000);
+
+        // Poll for status changes every 5 seconds (to keep badge up to date)
+        zaloStatusInterval = setInterval(async () => {
+            if (!zaloActive) return;
+            try {
+                const response = await fetch('/api/zalo/status');
+                if (response.ok) {
+                    const data = await response.json();
+                    updateZaloUI(data.active, data.login_status);
+                }
+            } catch (e) {
+                console.error('Lỗi khi cập nhật trạng thái badge Zalo:', e);
+            }
+        }, 5000);
+    }
+
+    function stopZaloPolling() {
+        if (zaloPollInterval) {
+            clearInterval(zaloPollInterval);
+            zaloPollInterval = null;
+        }
+        if (zaloStatusInterval) {
+            clearInterval(zaloStatusInterval);
+            zaloStatusInterval = null;
+        }
+    }
+
     // Initial load
     loadConfig();
     loadHistory();
+    loadZaloStatus();
 });
